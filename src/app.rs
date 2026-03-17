@@ -397,18 +397,6 @@ impl App {
         self.toasts.retain(|t| !t.is_expired());
     }
 
-    pub fn cycle_theme(&mut self) {
-        let next = match self.config.theme.name.as_str() {
-            "dark" => "light",
-            "light" => "solarized",
-            _ => "dark",
-        };
-        self.config.theme.name = next.to_string();
-        self.theme = self.config.theme_colors();
-        let _ = self.config.save();
-        self.add_toast(Toast::info(format!("Theme: {}", next)));
-    }
-
     pub fn save_layout(&mut self) {
         self.config.layout.sidebar_visible = self.sidebar_visible;
         self.config.layout.diff_visible = self.diff_visible;

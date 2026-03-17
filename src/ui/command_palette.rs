@@ -23,7 +23,6 @@ pub enum PaletteAction {
     ToggleSidebar,
     ToggleDiff,
     FocusMode,
-    CycleTheme,
     Quit,
 }
 
@@ -45,7 +44,6 @@ impl PaletteState {
         items.push(PaletteItem { label: "Toggle sidebar".to_string(), kind: PaletteAction::ToggleSidebar });
         items.push(PaletteItem { label: "Toggle diff pane".to_string(), kind: PaletteAction::ToggleDiff });
         items.push(PaletteItem { label: "Focus mode (Ctrl+F)".to_string(), kind: PaletteAction::FocusMode });
-        items.push(PaletteItem { label: "Cycle theme".to_string(), kind: PaletteAction::CycleTheme });
         items.push(PaletteItem { label: "Quit (Ctrl+Q)".to_string(), kind: PaletteAction::Quit });
 
         let filtered: Vec<usize> = (0..items.len()).collect();

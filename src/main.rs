@@ -474,7 +474,6 @@ fn handle_palette_key(app: &mut App, key: KeyEvent, term_size: Size) -> anyhow::
                         app.save_layout();
                     }
                     PaletteAction::FocusMode => app.toggle_focus_mode(),
-                    PaletteAction::CycleTheme => app.cycle_theme(),
                     PaletteAction::Quit => {
                         app.should_quit = true;
                         return Ok(false);
