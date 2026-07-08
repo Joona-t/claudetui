@@ -18,7 +18,40 @@ use ratatui::prelude::*;
 use std::io::{self, stdout};
 use std::time::Duration;
 
+// --- Allocation counter for the redraw benchmark (`claudetui --bench-redraw`) ---
+// Wraps the system allocator with an atomic counter so BUG-P1-8's before/after
+// numbers come from real code paths instead of being estimated by hand.
+mod bench_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub struct CountingAllocator;
+
+    static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    pub fn count() -> usize {
+        ALLOC_COUNT.load(Ordering::Relaxed)
+    }
+}
+
+#[global_allocator]
+static GLOBAL: bench_alloc::CountingAllocator = bench_alloc::CountingAllocator;
+
 fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|a| a == "--bench-redraw") {
+        return run_redraw_benchmark();
+    }
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -62,15 +95,36 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::Res
     app.add_session(name, cwd, pty_session);
 
     let mut last_size = size;
+    // Tracks the active session's PtySession::generation() as of the last
+    // redraw, so we can tell "new PTY output arrived" apart from "nothing
+    // changed" without touching the (mutex-guarded) vt100 parser every tick.
+    let mut last_seen_pty_generation = 0u64;
 
     loop {
-        // Draw UI
-        terminal.draw(|frame| ui::draw(frame, &app))?;
+        // New PTY output on the active session is the one state change that
+        // doesn't flow through a key event or an App mutator method — check
+        // it explicitly before deciding whether this frame needs a redraw.
+        let active_generation = app.active_pty().map(|p| p.generation()).unwrap_or(0);
+        if active_generation != last_seen_pty_generation {
+            last_seen_pty_generation = active_generation;
+            app.mark_dirty();
+        }
+
+        // Dirty-flag redraw: only rebuild the widget tree (which walks every
+        // cell of the terminal pane and allocates a Span per cell) when
+        // something actually changed since the last frame. Idle frames with
+        // no keypress, no new PTY output, and no toast/diff change are now a
+        // single atomic load + branch instead of a full redraw.
+        if app.dirty {
+            terminal.draw(|frame| ui::draw(frame, &app))?;
+            app.dirty = false;
+        }
 
         // Handle resize
         let current_size = terminal.size()?;
         if current_size != last_size {
             last_size = current_size;
+            app.mark_dirty();
             let (pty_cols, pty_rows) = calc_pty_size(&app, current_size);
             if let Some(pty) = app.active_pty() {
                 let _ = pty.resize(pty_rows, pty_cols);
@@ -81,12 +135,13 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::Res
         if event::poll(Duration::from_millis(16))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    app.mark_dirty();
                     if !handle_key(&mut app, key, last_size)? {
                         break;
                     }
                 }
                 Event::Resize(_, _) => {
-                    // Handled above on next loop iteration
+                    app.mark_dirty();
                 }
                 _ => {}
             }
@@ -118,6 +173,79 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::Res
         if app.should_quit {
             break;
         }
+    }
+
+    Ok(())
+}
+
+/// Crude before/after allocation benchmark for BUG-P1-8 (dirty-flag redraw).
+/// Spawns a real PTY session with some static output, then simulates 60
+/// "idle" frames (a 1-second stretch at 60fps where nothing new happens)
+/// two ways: (a) the old behavior — redraw unconditionally every tick, and
+/// (b) the new behavior — redraw only when `PtySession::generation()`
+/// changes. Both paths call the exact same `terminal_pane::draw` used in
+/// production; only the allocator counts differ. Run via:
+///   cargo run --release -- --bench-redraw
+fn run_redraw_benchmark() -> anyhow::Result<()> {
+    use ratatui::backend::TestBackend;
+
+    const FRAMES: usize = 60; // ~1s of idle time at 60fps
+
+    // A session that prints a bit of static multi-line output and then goes
+    // quiet — representative of an idle Claude Code session sitting at a
+    // finished response.
+    let pty = pty::session::PtySession::spawn(
+        "sh",
+        ".",
+        24,
+        80,
+    )?;
+    pty.write(b"printf 'line one\\nline two\\nline three\\n'; sleep 30\n")?;
+    // Give the reader thread time to process the output into the parser.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let area_size = (80u16, 24u16);
+
+    // --- Scenario A: old behavior — redraw every idle frame unconditionally ---
+    let backend_a = TestBackend::new(area_size.0, area_size.1);
+    let mut terminal_a = Terminal::new(backend_a)?;
+    let before_a = bench_alloc::count();
+    for _ in 0..FRAMES {
+        terminal_a.draw(|frame| {
+            let area = frame.area();
+            ui::terminal_pane::draw(frame, &pty, area, true);
+        })?;
+    }
+    let after_a = bench_alloc::count();
+    let allocs_old = after_a - before_a;
+
+    // --- Scenario B: new behavior — dirty-flag gated redraw ---
+    let backend_b = TestBackend::new(area_size.0, area_size.1);
+    let mut terminal_b = Terminal::new(backend_b)?;
+    let mut last_seen_generation = u64::MAX; // force the first frame to draw
+    let before_b = bench_alloc::count();
+    for _ in 0..FRAMES {
+        let gen = pty.generation();
+        if gen != last_seen_generation {
+            last_seen_generation = gen;
+            terminal_b.draw(|frame| {
+                let area = frame.area();
+                ui::terminal_pane::draw(frame, &pty, area, true);
+            })?;
+        }
+        // else: idle frame, skipped entirely — this is the fix.
+    }
+    let after_b = bench_alloc::count();
+    let allocs_new = after_b - before_b;
+
+    pty.kill();
+
+    println!("BUG-P1-8 dirty-flag redraw benchmark ({FRAMES} idle frames, ~1s @ 60fps)");
+    println!("  before (redraw every tick):   {allocs_old} allocations  ({:.0}/frame)", allocs_old as f64 / FRAMES as f64);
+    println!("  after  (dirty-flag gated):    {allocs_new} allocations  ({:.0}/frame)", allocs_new as f64 / FRAMES as f64);
+    if allocs_old > 0 {
+        let reduction = 100.0 * (1.0 - allocs_new as f64 / allocs_old as f64);
+        println!("  reduction: {reduction:.1}%");
     }
 
     Ok(())
