@@ -173,6 +173,12 @@ pub struct App {
     pub palette: Option<PaletteState>,
     pub toasts: Vec<Toast>,
     pub diff_worker: DiffWorker,
+    /// Set whenever app state changes in a way that affects what's on screen.
+    /// The render loop only calls `terminal.draw()` when this is true, then
+    /// clears it — idle frames (no keypress, no new PTY output, no toast/diff
+    /// change) skip the redraw entirely instead of rebuilding the whole
+    /// widget tree every tick. See BUG-P1-8 in BUGS_AND_ITERATIONS.md.
+    pub dirty: bool,
 }
 
 impl App {
@@ -197,7 +203,13 @@ impl App {
             palette: None,
             toasts,
             diff_worker: DiffWorker::new(),
+            dirty: true, // first frame always needs a real draw
         }
+    }
+
+    /// Mark that app state changed and the next frame needs a real redraw.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
     }
 
     pub fn add_session(&mut self, name: String, directory: String, pty: PtySession) {
@@ -233,6 +245,7 @@ impl App {
     pub fn poll_git_watchers(&mut self) {
         // Phase 1: Check if the background worker has a result ready
         if let Some((dir, files)) = self.diff_worker.take_result() {
+            self.mark_dirty();
             // Match result to the session that owns this directory
             for session in &mut self.sessions {
                 if session.directory == dir {
@@ -391,10 +404,15 @@ impl App {
 
     pub fn add_toast(&mut self, toast: Toast) {
         self.toasts.push(toast);
+        self.mark_dirty();
     }
 
     pub fn prune_toasts(&mut self) {
+        let before = self.toasts.len();
         self.toasts.retain(|t| !t.is_expired());
+        if self.toasts.len() != before {
+            self.mark_dirty();
+        }
     }
 
     pub fn save_layout(&mut self) {

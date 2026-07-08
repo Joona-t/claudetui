@@ -1,6 +1,7 @@
 use anyhow::Result;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -10,6 +11,11 @@ pub struct PtySession {
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
     master: Box<dyn MasterPty + Send>,
     alive: Arc<Mutex<bool>>,
+    /// Bumped by the reader thread every time new PTY output is processed into
+    /// the vt100 parser. The render loop compares this against the last value
+    /// it saw to decide whether the terminal pane needs a real redraw —
+    /// avoids taking the parser lock just to detect "nothing changed".
+    generation: Arc<AtomicU64>,
 }
 
 impl PtySession {
@@ -39,10 +45,12 @@ impl PtySession {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 1000)));
         let master_writer = Arc::new(Mutex::new(writer));
         let alive = Arc::new(Mutex::new(true));
+        let generation = Arc::new(AtomicU64::new(0));
 
         // Spawn reader thread that feeds PTY output into vt100 parser
         let parser_clone = Arc::clone(&parser);
         let alive_clone = Arc::clone(&alive);
+        let generation_clone = Arc::clone(&generation);
         thread::spawn(move || {
             let mut reader = reader;
             let mut buf = [0u8; 4096];
@@ -53,6 +61,9 @@ impl PtySession {
                         if let Ok(mut p) = parser_clone.lock() {
                             p.process(&buf[..n]);
                         }
+                        // New output landed — bump the generation counter so the
+                        // render loop knows this session's screen changed.
+                        generation_clone.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(_) => break,
                 }
@@ -68,6 +79,7 @@ impl PtySession {
             child: Arc::new(Mutex::new(child)),
             master: pair.master,
             alive,
+            generation,
         })
     }
 
@@ -100,6 +112,14 @@ impl PtySession {
             .map_err(|_| anyhow::anyhow!("PTY parser lock poisoned"))?;
         parser.set_size(rows, cols);
         Ok(())
+    }
+
+    /// Monotonically increasing counter, bumped once per chunk of PTY output
+    /// processed. Cheap (single atomic load, no lock) — used by the render
+    /// loop to decide whether the terminal pane actually needs to be rebuilt
+    /// this frame, instead of rebuilding it unconditionally every tick.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     /// Check if the child process is still running
