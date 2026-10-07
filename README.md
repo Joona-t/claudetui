@@ -86,7 +86,7 @@ Requires `claude` CLI to be installed and available in PATH.
 
 Phase 1 is complete — the core multiplexer works. Known areas for improvement:
 
-- Hot path allocations in terminal rendering (~144k heap allocs/sec at 60fps)
+- ~~Hot path allocations in terminal rendering (~144k heap allocs/sec at 60fps)~~ — fixed via dirty-flag/generation-gated redraw, see BUGS_AND_ITERATIONS.md (BUG-P1-8). Idle frames no longer redraw at all (~98% fewer allocations measured via `--bench-redraw`); the remaining per-cell `Span` allocation cost on frames that *do* draw is untouched and still a candidate for a follow-up.
 - Git branch name queried from filesystem every frame (should be cached)
 - Silent failures on git stage/revert operations (need toast feedback)
 - Zombie process cleanup on PTY drop
