@@ -49,3 +49,16 @@ reduction: 98.3%
 At 60fps that's ~106k allocs/sec before vs. ~1.8k allocs/sec after on a truly idle session (in the same ballpark as the README's informal ~144k/sec estimate, which used a larger/differently-colored real Claude Code screen). The residual ~30 allocs on the one frame that does draw is the existing per-cell `Span`/`Vec` cost from `terminal_pane::draw` — untouched by this fix, candidate for a follow-up if it ever matters (P2, not in scope here).
 
 **Verification:** `cargo build --release` green, same pre-existing warning count (6, none new). `cargo test --release` green (0 tests in repo — no existing test suite to regress). No interactive TTY available in this environment to smoke-test the live app end-to-end (crossterm's `enable_raw_mode()` requires a real tty; this sandbox's Bash tool has none), so verification is via the release build + the `--bench-redraw` harness, which exercises the real `PtySession` and `terminal_pane::draw` code paths end-to-end with a live spawned subprocess.
+
+## 2026-10-07: BUG-P1-9 — Dead PTY session never redrawn under dirty-flag gating
+
+**Problem:** After BUG-P1-8, the render loop only redraws when `app.dirty` is set or the active session's `generation()` changes. A child process exiting produces neither: no new PTY output, no key event. `src/ui/sidebar.rs` renders a `✗` dead marker from `pty.is_alive()`, and the crash-recovery loop in `run_app()` only marks dirty indirectly via `add_toast()` when the respawn *succeeds*. If `PtySession::spawn("claude", ...)` fails (binary missing, PATH broken, cwd deleted), the pane stayed frozen with no `✗` until the next keypress. Pre-P1-8 this redrew within 16ms.
+
+**Root cause:** Child exit is a visible state transition that was not wired into the dirty-flag signal.
+
+**Fix:**
+- `src/pty/session.rs`: the reader thread bumps `generation` once after setting `alive = false`, so the active session's death is seen by the existing generation check.
+- `src/main.rs`: crash-recovery loop calls `app.mark_dirty()` on each restart attempt (once per 5s backoff), so non-active sessions' sidebar marker updates even when respawn fails.
+- Regression test `pty::session::tests::child_exit_bumps_generation_without_output` — spawns `true` (zero output), waits for exit, asserts `generation() >= 1`.
+
+**Verification:** `cargo build --release` + `cargo test --release` (1 test passes; fails before the fix with generation == 0).

@@ -71,6 +71,10 @@ impl PtySession {
             if let Ok(mut a) = alive_clone.lock() {
                 *a = false;
             }
+            // The child exiting is a visible state change too (sidebar dead
+            // marker, frozen pane). Bump the generation so the dirty-flag
+            // render loop redraws even though no new output arrived. BUG-P1-9.
+            generation_clone.fetch_add(1, Ordering::Relaxed);
         });
 
         Ok(Self {
@@ -143,5 +147,30 @@ impl PtySession {
 impl Drop for PtySession {
     fn drop(&mut self) {
         self.kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// BUG-P1-9 regression: a child that exits WITHOUT printing anything must
+    /// still bump `generation()`, otherwise the dirty-flag render loop never
+    /// redraws the dead session (no key, no output, no toast if restart fails).
+    #[test]
+    fn child_exit_bumps_generation_without_output() {
+        let pty = PtySession::spawn("true", ".", 24, 80).expect("spawn `true`");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pty.is_alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!pty.is_alive(), "child `true` should have exited within 5s");
+        // Give the reader thread a moment to run the post-loop bump.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            pty.generation() >= 1,
+            "generation must be bumped on child exit even with zero output"
+        );
     }
 }

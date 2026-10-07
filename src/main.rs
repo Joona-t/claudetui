@@ -160,6 +160,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::Res
                     .map(|t| t.elapsed() >= Duration::from_secs(5))
                     .unwrap_or(true);
                 if !should_restart { continue; }
+                // Dead session is a visible change (sidebar `✗` marker) even if
+                // the respawn below fails and no toast is added. BUG-P1-9.
+                app.mark_dirty();
                 let dir = app.sessions[i].directory.clone();
                 let (pty_cols, pty_rows) = calc_pty_size(&app, last_size);
                 app.sessions[i].last_restart = Some(std::time::Instant::now());
